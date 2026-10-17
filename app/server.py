@@ -11,31 +11,129 @@ import base64
 import json
 import os
 import random
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from pipeline import ACCEPTED_MODELS, MAX_REFERENCES, MODEL_ID, build_prompt, build_upsampler, output_size
 
 COMFY_URL = os.environ.get("COMFY_URL", "http://127.0.0.1:8188").rstrip("/")
 TIMEOUT = float(os.environ.get("GENERATION_TIMEOUT", "900"))
+_JOBS: dict[str, dict] = {}
+_JOBS_LOCK = threading.Lock()
+_MAX_JOBS = 8
+
+
+def _remember(job_id: str, payload: dict) -> None:
+    with _JOBS_LOCK:
+        _JOBS[job_id] = payload
+        while len(_JOBS) > _MAX_JOBS:
+            oldest = next(iter(_JOBS))
+            if oldest == job_id:
+                break
+            _JOBS.pop(oldest, None)
+
+
+def _job(job_id: str) -> dict | None:
+    with _JOBS_LOCK:
+        payload = _JOBS.get(job_id)
+        return None if payload is None else dict(payload)
+
+
+def _job_id(path: str) -> str | None:
+    for prefix in ("/v1/images/", "/api/v1/images/"):
+        if not path.startswith(prefix):
+            continue
+        job_id = path[len(prefix) :]
+        if len(job_id) == 32 and all(char in "0123456789abcdef" for char in job_id):
+            return job_id
+        return ""
+    return None
+
+
+def _start_job(body: dict) -> str:
+    if not isinstance(body, dict):
+        raise ValueError("Expected a JSON object.")
+    job_id = uuid.uuid4().hex
+    _remember(job_id, {"id": job_id, "status": "running"})
+
+    def run() -> None:
+        try:
+            image = generate(body)
+        except ValueError as exc:
+            _remember(
+                job_id,
+                {
+                    "id": job_id,
+                    "status": "failed",
+                    "error": str(exc),
+                    "http_status": 400,
+                },
+            )
+            return
+        except Exception as exc:
+            print(f"job {job_id} failed: {exc}", flush=True)
+            _remember(
+                job_id,
+                {
+                    "id": job_id,
+                    "status": "failed",
+                    "error": str(exc),
+                    "http_status": 502,
+                },
+            )
+            return
+        _remember(
+            job_id,
+            {
+                "id": job_id,
+                "status": "succeeded",
+                "created": int(time.time()),
+                "data": [
+                    {
+                        "b64_json": base64.b64encode(image).decode(),
+                        "media_type": "image/png",
+                    }
+                ],
+            },
+        )
+
+    threading.Thread(target=run, name=f"klein-{job_id[:8]}", daemon=True).start()
+    return job_id
 
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def do_GET(self) -> None:
-        if self.path.split("?", 1)[0] != "/health":
+        path = self.path.split("?", 1)[0]
+        if path == "/health":
+            try:
+                with urllib.request.urlopen(f"{COMFY_URL}/system_stats", timeout=2) as response:
+                    ok = response.status == 200
+            except (urllib.error.URLError, TimeoutError):
+                ok = False
+            self._json(200 if ok else 503, {"status": "ok" if ok else "starting"})
+            return
+        job_id = _job_id(path)
+        if not job_id:
             self._json(404, {"error": "not found"})
             return
-        try:
-            with urllib.request.urlopen(f"{COMFY_URL}/system_stats", timeout=2) as response:
-                ok = response.status == 200
-        except (urllib.error.URLError, TimeoutError):
-            ok = False
-        self._json(200 if ok else 503, {"status": "ok" if ok else "starting"})
+        payload = _job(job_id)
+        if payload is None:
+            self._json(404, {"error": "not found"})
+            return
+        if payload.get("status") == "failed":
+            self._json(
+                int(payload.get("http_status") or 502),
+                {"error": str(payload.get("error") or "generation failed")},
+            )
+            return
+        self._json(200, payload)
 
     def do_POST(self) -> None:
         path = self.path.split("?", 1)[0]
@@ -45,20 +143,11 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         try:
             body = json.loads(self.rfile.read(length) or b"{}")
-            image = generate(body)
-        except ValueError as exc:
+            job_id = _start_job(body)
+        except (ValueError, json.JSONDecodeError) as exc:
             self._json(400, {"error": str(exc)})
             return
-        except RuntimeError as exc:
-            self._json(502, {"error": str(exc)})
-            return
-        self._json(
-            200,
-            {
-                "created": int(time.time()),
-                "data": [{"b64_json": base64.b64encode(image).decode(), "media_type": "image/png"}],
-            },
-        )
+        self._json(202, {"id": job_id, "status": "running"})
 
     def log_message(self, fmt: str, *args) -> None:
         print(f"{self.address_string()} {fmt % args}", flush=True)

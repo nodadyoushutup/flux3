@@ -1,8 +1,9 @@
-"""Use the torch deltanet path inside ComfyUI.
+"""Use torch for ComfyUI's Qwen attention kernels.
 
-comfy_kitchen treats every sm_80 GPU as kernel-capable. On an A100 the CUDA
-launch is rejected, so the Qwen upsampler dies before Klein samples. Patch the
-module when ComfyUI imports it, after Comfy has chosen its CUDA allocator.
+comfy_kitchen's CUDA kernels report this A100 as supported and then fail at
+launch. The torch implementations compute the same attention, so generation
+can finish. The patch is applied when ComfyUI imports each module, after
+Comfy has chosen its CUDA allocator.
 """
 
 from __future__ import annotations
@@ -11,12 +12,30 @@ import sys
 from importlib.abc import MetaPathFinder
 from importlib.machinery import PathFinder
 
+_MODULES = {
+    "comfy_kitchen.gated_delta",
+    "comfy_kitchen.flash_attention",
+}
 
-class _DeltanetFinder(MetaPathFinder):
+
+def _force_torch(module) -> None:
+    for name in (
+        "deferred_is_available",
+        "is_available",
+        "flash_attention_decode_gqa_is_available",
+    ):
+        if hasattr(module, name):
+            setattr(module, name, lambda *args, **kwargs: False)
+
+
+class _KitchenFinder(MetaPathFinder):
     def find_spec(self, fullname, path, target=None):
-        if fullname != "comfy_kitchen.gated_delta":
+        if fullname not in _MODULES:
             return None
         sys.meta_path.remove(self)
+        _MODULES.discard(fullname)
+        if _MODULES:
+            sys.meta_path.insert(0, _KitchenFinder())
         spec = PathFinder.find_spec(fullname, path)
         if spec is None or spec.loader is None:
             return spec
@@ -24,10 +43,10 @@ class _DeltanetFinder(MetaPathFinder):
 
         def exec_module(module):
             real_exec(module)
-            module.deferred_is_available = lambda *args, **kwargs: False
+            _force_torch(module)
 
         spec.loader.exec_module = exec_module
         return spec
 
 
-sys.meta_path.insert(0, _DeltanetFinder())
+sys.meta_path.insert(0, _KitchenFinder())

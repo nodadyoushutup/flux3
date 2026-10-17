@@ -1,0 +1,18 @@
+services:
+  flux3:
+    image: flux3-klein:local
+    env_file:
+      - .env
+    ports:
+      - "8188:8188"
+      - "8199:8099"
+    volumes:
+      - models:/models
+      - ./entrypoint.sh:/opt/flux3/entrypoint.sh:ro
+      - ./app:/opt/flux3/app:ro
+      - ./workflows:/opt/flux3/workflows:ro
+      - ./custom_nodes/optional_image_batch.py:/opt/ComfyUI/custom_nodes/optional_image_batch.py:ro
+    gpus: all
+
+volumes:
+  models:

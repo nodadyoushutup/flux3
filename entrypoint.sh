@@ -9,7 +9,7 @@ mkdir -p /opt/ComfyUI/user/default/workflows
 cp -f /opt/flux3/workflows/*.json /opt/ComfyUI/user/default/workflows/
 
 cd /opt/ComfyUI
-python main.py --listen 0.0.0.0 --port 8188 --disable-auto-launch --disable-dynamic-vram &
+PYTHONPATH=/opt/flux3/app python main.py --listen 0.0.0.0 --port 8188 --disable-auto-launch --disable-dynamic-vram &
 comfy_pid=$!
 trap 'kill "$comfy_pid"' EXIT INT TERM
 

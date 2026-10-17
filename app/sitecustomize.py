@@ -1,9 +1,10 @@
 """Use torch for ComfyUI's Qwen attention kernels.
 
 comfy_kitchen's CUDA kernels report this A100 as supported and then fail at
-launch. The torch implementations compute the same attention, so generation
-can finish. The patch is applied when ComfyUI imports each module, after
-Comfy has chosen its CUDA allocator.
+launch. Sage INT8 attention fails the same way: ``detect_k_anchor`` was built
+for a newer CUDA than the host driver. PyTorch SDPA computes the attention
+instead. The patch is applied when ComfyUI imports each module, after Comfy
+has chosen its CUDA allocator.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from importlib.machinery import PathFinder
 _MODULES = {
     "comfy_kitchen.gated_delta",
     "comfy_kitchen.flash_attention",
+    "comfy_kitchen.sage_attention",
 }
 
 

@@ -1,10 +1,9 @@
 """Restore a photograph, then enlarge it to an exact pixel size.
 
-JPEG cleanup only moves the smooth band, so grain stays with the
-photograph. A 4x photographic super-resolution model then rebuilds
-edges, hair, and texture. Large-scale color and shading stay on a plain
-resample of that cleaned frame; the model's lightness detail is mixed
-in full. Nothing in this path is a text-to-image sample.
+A 4x photographic super-resolution model rebuilds edges and texture,
+then the frame is scaled back to the requested size. The photograph
+keeps its color and broad shading. The model keeps the edges. Nothing
+in this path is a text-to-image sample.
 """
 
 from __future__ import annotations
@@ -15,16 +14,11 @@ from pathlib import Path
 
 from PIL import Image, ImageOps
 
-DEBLOCK_NAME = "scunet_color_real_gan.pth"
-# RealESRGAN's photo weights are trained to denoise, which reads as
-# plastic skin. UltraSharp is the same RRDB family with the texture left in.
-UPSCALE_NAME = "4x-UltraSharp.pth"
-# Share of the deblocker's smooth band to accept. The photograph keeps
-# its own grain either way.
-DEBLOCK_AMOUNT = 0.45
-DEBLOCK_RADIUS = 3.0
-# Full lightness detail from the upscaler. Color stays with the photograph,
-# so the model cannot wash the grade or repaint skin.
+# HAT model trained on real photos with JPEG and blur. GAN upscalers
+# such as UltraSharp add crunch and plastic texture instead.
+UPSCALE_NAME = "4xNomos8kSCHAT-L.safetensors"
+# How much of the upscaler's broad shading to replace with the photograph.
+# Edges stay with the model either way.
 DETAIL_AMOUNT = 1.0
 LONG_EDGE = {
     "512": 512,
@@ -76,11 +70,11 @@ def target_size(width: int, height: int, resolution: str) -> tuple[int, int]:
 
 
 def detail_radius(width: int, height: int) -> float:
-    """Return the split between facial form and reconstructed texture.
+    """Return the broad-shading band that stays with the photograph.
 
-    A one-pixel split only puts grain back on a soft enlargement. Edges,
-    hair, and pores sit further out, and they cover more pixels as the
-    frame gets larger.
+    The upscaler is trained at 4x and is then scaled back to the
+    requested size. Edges inside this radius come from that result.
+    Larger shapes and the color grade stay with the photograph.
 
     Args:
         width: Output width in pixels.
@@ -89,11 +83,11 @@ def detail_radius(width: int, height: int) -> float:
     Returns:
         Gaussian radius in pixels.
     """
-    return max(3.0, min(width, height) * 0.005)
+    return max(16.0, min(width, height) * 0.02)
 
 
 def restore(blob: bytes, width: int, height: int) -> bytes:
-    """Deblock ``blob`` and scale it to ``width`` by ``height``.
+    """Scale ``blob`` to ``width`` by ``height`` and restore its edges.
 
     Args:
         blob: Encoded source photograph.
@@ -109,9 +103,8 @@ def restore(blob: bytes, width: int, height: int) -> bytes:
     if width < 1 or height < 1:
         raise ValueError("width and height must be positive")
     image = _open(blob)
-    cleaned = _deblock(image)
-    base = _fit(cleaned, width, height)
-    enlarged = cleaned
+    base = _fit(image, width, height)
+    enlarged = image
     passes = 0
     while (
         passes < 2
@@ -138,23 +131,6 @@ def _fit(image: Image.Image, width: int, height: int) -> Image.Image:
     return image.resize((width, height), Image.Resampling.LANCZOS)
 
 
-def _mix_low(
-    base: Image.Image,
-    donor: Image.Image,
-    *,
-    radius: float,
-    amount: float,
-) -> Image.Image:
-    """Keep ``base`` texture and move its smooth band toward ``donor``."""
-    import numpy as np
-
-    base_arr = np.asarray(base, dtype=np.float32)
-    mixed = base_arr + amount * (
-        _gaussian(donor, radius) - _gaussian(base, radius)
-    )
-    return Image.fromarray(np.clip(mixed, 0, 255).astype("uint8"), mode="RGB")
-
-
 def _transfer_detail(
     base: Image.Image,
     detailed: Image.Image,
@@ -162,31 +138,42 @@ def _transfer_detail(
     radius: float,
     amount: float,
 ) -> Image.Image:
-    """Keep ``base`` color and add ``detailed`` lightness above ``radius``."""
-    import numpy as np
-    from PIL import ImageFilter
+    """Keep ``base`` color. Take edges from ``detailed``.
 
+    Broad lightness moves toward the photograph by ``amount``. Finer
+    lightness stays with the upscaler, which is what makes the frame
+    sharper than a plain resample.
+    """
+    import numpy as np
+
+    base_arr = np.asarray(base, dtype=np.float32)
     detailed_arr = np.asarray(detailed, dtype=np.float32)
-    luma = (
-        detailed_arr[..., 0] * 0.2126
-        + detailed_arr[..., 1] * 0.7152
-        + detailed_arr[..., 2] * 0.0722
+    base_l = _luma(base_arr)
+    detailed_l = _luma(detailed_arr)
+    lightness = detailed_l + amount * (
+        _blur_plane(base_l, radius) - _blur_plane(detailed_l, radius)
     )
-    plane = Image.fromarray(np.clip(luma, 0, 255).astype("uint8"), mode="L")
-    low = np.asarray(
-        plane.filter(ImageFilter.GaussianBlur(radius=radius)),
-        dtype=np.float32,
-    )
-    mixed = np.asarray(base, dtype=np.float32) + (amount * (luma - low))[..., None]
+    mixed = base_arr - base_l[..., None] + lightness[..., None]
     return Image.fromarray(np.clip(mixed, 0, 255).astype("uint8"), mode="RGB")
 
 
-def _gaussian(image: Image.Image, radius: float):
+def _luma(array):
+    return (
+        array[..., 0] * 0.2126
+        + array[..., 1] * 0.7152
+        + array[..., 2] * 0.0722
+    )
+
+
+def _blur_plane(plane, radius: float):
     import numpy as np
     from PIL import ImageFilter
 
-    blurred = image.filter(ImageFilter.GaussianBlur(radius=radius))
-    return np.asarray(blurred, dtype=np.float32)
+    image = Image.fromarray(np.clip(plane, 0, 255).astype("uint8"), mode="L")
+    return np.asarray(
+        image.filter(ImageFilter.GaussianBlur(radius=radius)),
+        dtype=np.float32,
+    )
 
 
 def _open(blob: bytes) -> Image.Image:
@@ -197,18 +184,6 @@ def _open(blob: bytes) -> Image.Image:
         raise ValueError("source image could not be read") from exc
     oriented = ImageOps.exif_transpose(image) or image
     return oriented.convert("RGB")
-
-
-def _deblock(image: Image.Image) -> Image.Image:
-    restored = _apply(_load(DEBLOCK_NAME), image)
-    if restored.size != image.size:
-        restored = _fit(restored, image.width, image.height)
-    return _mix_low(
-        image,
-        restored,
-        radius=DEBLOCK_RADIUS,
-        amount=DEBLOCK_AMOUNT,
-    )
 
 
 def _enlarge(image: Image.Image) -> Image.Image:

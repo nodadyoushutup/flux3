@@ -55,18 +55,12 @@ def ensure_models(models_dir: Path, token: str | None) -> None:
             return
 
 
-# ``expected_size`` is set for pickled checkpoints. Zip checkpoints are
-# checked by archive integrity and only need to clear the size floor.
+# ``expected_size`` is the published byte count for the safetensors file.
 UPSCALE_FILES = {
-    "scunet_color_real_gan.pth": (
-        "https://github.com/cszn/KAIR/releases/download/v1.0/"
-        "scunet_color_real_gan.pth",
-        None,
-    ),
-    "4x-UltraSharp.pth": (
-        "https://huggingface.co/Kim2091/UltraSharp/resolve/main/"
-        "4x-UltraSharp.pth",
-        66_961_958,
+    "4xNomos8kSCHAT-L.safetensors": (
+        "https://huggingface.co/Phips/4xNomos8kSCHAT-L/resolve/main/"
+        "4xNomos8kSCHAT-L.safetensors",
+        165_299_372,
     ),
 }
 
@@ -74,8 +68,8 @@ UPSCALE_FILES = {
 def _weights_ok(path: Path, expected_size: int | None = None) -> bool:
     """Return whether ``path`` is a complete upscale checkpoint.
 
-    Newer weights are zip archives. UltraSharp is a legacy pickle, so a
-    matching byte count is the completeness check for that file.
+    Safetensors and legacy pickles are checked by byte count. Zip
+    checkpoints are checked by archive integrity.
     """
     if not path.is_file():
         return False
@@ -89,7 +83,11 @@ def _weights_ok(path: Path, expected_size: int | None = None) -> bool:
         with zipfile.ZipFile(path) as archive:
             return archive.testzip() is None
     with path.open("rb") as handle:
-        return handle.read(1) == b"\x80"
+        header = handle.read(9)
+    if len(header) == 9 and header[8:9] == b"{":
+        length = int.from_bytes(header[:8], "little")
+        return 0 < length < 100_000_000
+    return header[:1] == b"\x80"
 
 
 def ensure_upscale_models(models_dir: Path) -> None:

@@ -4,7 +4,10 @@ from pathlib import Path
 
 from download_models import ensure_models, missing
 from pipeline import build_prompt, build_upsampler, canvas_size, megapixels, normalize_resolution, output_size
+from upscale import detail_radius
 from upscale import target_size
+from upscale import _mix_low
+from upscale import _transfer_detail
 
 
 class CanvasTest(unittest.TestCase):
@@ -90,6 +93,48 @@ class DownloadTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             ensure_models(Path(directory), None)
             self.assertTrue(missing(Path(directory)))
+
+
+class DetailMixTest(unittest.TestCase):
+    def test_radius_covers_edges_on_a_large_frame(self):
+        self.assertGreater(detail_radius(2048, 2048), 8)
+        self.assertGreater(detail_radius(4096, 2160), 10)
+
+    def test_detail_keeps_photograph_color(self):
+        from PIL import Image
+
+        base = Image.new("RGB", (32, 32), (200, 30, 30))
+        detailed = Image.new("RGB", (32, 32), (30, 30, 200))
+        mixed = _transfer_detail(base, detailed, radius=8, amount=1)
+        self.assertEqual(mixed.getpixel((16, 16)), (200, 30, 30))
+
+    def test_detail_adds_lightness_from_the_upscaler(self):
+        from PIL import Image
+
+        base = Image.new("RGB", (64, 64), (80, 70, 60))
+        detailed = Image.new("RGB", (64, 64), (80, 70, 60))
+        for y in range(64):
+            for x in range(30, 34):
+                detailed.putpixel((x, y), (250, 250, 250))
+        mixed = _transfer_detail(base, detailed, radius=3, amount=1)
+        edge = mixed.getpixel((32, 32))
+        corner = mixed.getpixel((4, 4))
+        self.assertGreater(sum(edge), sum(corner) + 40)
+        self.assertLess(abs(edge[0] - edge[1]), 30)
+
+    def test_deblock_keeps_fine_texture(self):
+        from PIL import Image
+
+        base = Image.new("RGB", (32, 32), (40, 40, 40))
+        for y in range(32):
+            for x in range(0, 32, 2):
+                base.putpixel((x, y), (140, 140, 140))
+        donor = Image.new("RGB", (32, 32), (200, 180, 160))
+        mixed = _mix_low(base, donor, radius=4, amount=1)
+        bright = mixed.getpixel((0, 16))
+        dark = mixed.getpixel((1, 16))
+        self.assertGreater(bright[0] - dark[0], 60)
+        self.assertGreater(dark[0], 80)
 
 
 class TargetSizeTest(unittest.TestCase):

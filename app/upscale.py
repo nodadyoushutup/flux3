@@ -1,8 +1,10 @@
 """Restore a photograph, then enlarge it to an exact pixel size.
 
-SCUNet removes JPEG blocks at the source size. 4x-UltraSharp then adds
-real detail. A final resample only trims that result onto the requested
-frame. Nothing in this path is a text-to-image sample.
+JPEG cleanup only moves the smooth band, so grain stays with the
+photograph. A 4x photographic super-resolution model then rebuilds
+edges, hair, and texture. Large-scale color and shading stay on a plain
+resample of that cleaned frame; the model's lightness detail is mixed
+in full. Nothing in this path is a text-to-image sample.
 """
 
 from __future__ import annotations
@@ -14,7 +16,16 @@ from pathlib import Path
 from PIL import Image, ImageOps
 
 DEBLOCK_NAME = "scunet_color_real_gan.pth"
+# RealESRGAN's photo weights are trained to denoise, which reads as
+# plastic skin. UltraSharp is the same RRDB family with the texture left in.
 UPSCALE_NAME = "4x-UltraSharp.pth"
+# Share of the deblocker's smooth band to accept. The photograph keeps
+# its own grain either way.
+DEBLOCK_AMOUNT = 0.45
+DEBLOCK_RADIUS = 3.0
+# Full lightness detail from the upscaler. Color stays with the photograph,
+# so the model cannot wash the grade or repaint skin.
+DETAIL_AMOUNT = 1.0
 LONG_EDGE = {
     "512": 512,
     "768": 768,
@@ -64,6 +75,23 @@ def target_size(width: int, height: int, resolution: str) -> tuple[int, int]:
     return _even(target_width), _even(target_height)
 
 
+def detail_radius(width: int, height: int) -> float:
+    """Return the split between facial form and reconstructed texture.
+
+    A one-pixel split only puts grain back on a soft enlargement. Edges,
+    hair, and pores sit further out, and they cover more pixels as the
+    frame gets larger.
+
+    Args:
+        width: Output width in pixels.
+        height: Output height in pixels.
+
+    Returns:
+        Gaussian radius in pixels.
+    """
+    return max(3.0, min(width, height) * 0.005)
+
+
 def restore(blob: bytes, width: int, height: int) -> bytes:
     """Deblock ``blob`` and scale it to ``width`` by ``height``.
 
@@ -82,19 +110,83 @@ def restore(blob: bytes, width: int, height: int) -> bytes:
         raise ValueError("width and height must be positive")
     image = _open(blob)
     cleaned = _deblock(image)
+    base = _fit(cleaned, width, height)
     enlarged = cleaned
     passes = 0
     while (
-        passes < 3
+        passes < 2
         and max(width / enlarged.width, height / enlarged.height) > 1.05
     ):
         enlarged = _enlarge(enlarged)
         passes += 1
-    if enlarged.size != (width, height):
-        enlarged = enlarged.resize((width, height), Image.Resampling.LANCZOS)
+    if passes:
+        detailed = _fit(enlarged, width, height)
+        base = _transfer_detail(
+            base,
+            detailed,
+            radius=detail_radius(width, height),
+            amount=DETAIL_AMOUNT,
+        )
     output = io.BytesIO()
-    enlarged.save(output, format="PNG")
+    base.save(output, format="PNG")
     return output.getvalue()
+
+
+def _fit(image: Image.Image, width: int, height: int) -> Image.Image:
+    if image.size == (width, height):
+        return image
+    return image.resize((width, height), Image.Resampling.LANCZOS)
+
+
+def _mix_low(
+    base: Image.Image,
+    donor: Image.Image,
+    *,
+    radius: float,
+    amount: float,
+) -> Image.Image:
+    """Keep ``base`` texture and move its smooth band toward ``donor``."""
+    import numpy as np
+
+    base_arr = np.asarray(base, dtype=np.float32)
+    mixed = base_arr + amount * (
+        _gaussian(donor, radius) - _gaussian(base, radius)
+    )
+    return Image.fromarray(np.clip(mixed, 0, 255).astype("uint8"), mode="RGB")
+
+
+def _transfer_detail(
+    base: Image.Image,
+    detailed: Image.Image,
+    *,
+    radius: float,
+    amount: float,
+) -> Image.Image:
+    """Keep ``base`` color and add ``detailed`` lightness above ``radius``."""
+    import numpy as np
+    from PIL import ImageFilter
+
+    detailed_arr = np.asarray(detailed, dtype=np.float32)
+    luma = (
+        detailed_arr[..., 0] * 0.2126
+        + detailed_arr[..., 1] * 0.7152
+        + detailed_arr[..., 2] * 0.0722
+    )
+    plane = Image.fromarray(np.clip(luma, 0, 255).astype("uint8"), mode="L")
+    low = np.asarray(
+        plane.filter(ImageFilter.GaussianBlur(radius=radius)),
+        dtype=np.float32,
+    )
+    mixed = np.asarray(base, dtype=np.float32) + (amount * (luma - low))[..., None]
+    return Image.fromarray(np.clip(mixed, 0, 255).astype("uint8"), mode="RGB")
+
+
+def _gaussian(image: Image.Image, radius: float):
+    import numpy as np
+    from PIL import ImageFilter
+
+    blurred = image.filter(ImageFilter.GaussianBlur(radius=radius))
+    return np.asarray(blurred, dtype=np.float32)
 
 
 def _open(blob: bytes) -> Image.Image:
@@ -108,7 +200,15 @@ def _open(blob: bytes) -> Image.Image:
 
 
 def _deblock(image: Image.Image) -> Image.Image:
-    return _apply(_load(DEBLOCK_NAME), image)
+    restored = _apply(_load(DEBLOCK_NAME), image)
+    if restored.size != image.size:
+        restored = _fit(restored, image.width, image.height)
+    return _mix_low(
+        image,
+        restored,
+        radius=DEBLOCK_RADIUS,
+        amount=DEBLOCK_AMOUNT,
+    )
 
 
 def _enlarge(image: Image.Image) -> Image.Image:
@@ -136,7 +236,7 @@ def _apply(descriptor, image: Image.Image) -> Image.Image:
     import torch
 
     tile = int(os.environ.get("UPSCALE_TILE", "512"))
-    overlap = int(os.environ.get("UPSCALE_OVERLAP", "32"))
+    overlap = int(os.environ.get("UPSCALE_OVERLAP", "64"))
     device = next(descriptor.model.parameters()).device
     source = _tensor(image)
     _, _, height, width = source.shape

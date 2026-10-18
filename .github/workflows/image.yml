@@ -32,8 +32,8 @@ jobs:
         with:
           context: .
           push: true
+          provenance: false
+          sbom: false
           tags: |
             ghcr.io/nodadyoushutup/flux3:0.0.3
             ghcr.io/nodadyoushutup/flux3:sha-${{ github.sha }}
-          cache-from: type=registry,ref=ghcr.io/nodadyoushutup/flux3:buildcache
-          cache-to: type=registry,ref=ghcr.io/nodadyoushutup/flux3:buildcache,mode=max

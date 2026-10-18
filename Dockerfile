@@ -27,7 +27,8 @@ RUN git init \
     && git fetch --depth 1 origin ${COMFYUI_REF} \
     && git checkout --detach FETCH_HEAD \
     && pip install -r requirements.txt \
-    && pip install huggingface_hub
+    && pip install huggingface_hub \
+    && pip install spandrel
 
 COPY app /opt/flux3/app
 COPY workflows /opt/flux3/workflows

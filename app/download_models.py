@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+import urllib.request
 from pathlib import Path
 
 REPO = "black-forest-labs/flux-3-image-klein-comfy"
@@ -53,9 +54,34 @@ def ensure_models(models_dir: Path, token: str | None) -> None:
             return
 
 
+UPSCALE_FILES = {
+    "scunet_color_real_gan.pth": (
+        "https://github.com/cszn/KAIR/releases/download/v1.0/"
+        "scunet_color_real_gan.pth"
+    ),
+    "4x-UltraSharp.pth": (
+        "https://huggingface.co/Kim2091/UltraSharp/resolve/main/"
+        "4x-UltraSharp.pth"
+    ),
+}
+
+
+def ensure_upscale_models(models_dir: Path) -> None:
+    """Download the restoration weights when the volume does not have them."""
+    folder = models_dir / "upscale"
+    folder.mkdir(parents=True, exist_ok=True)
+    for name, url in UPSCALE_FILES.items():
+        path = folder / name
+        if path.is_file() and path.stat().st_size > 0:
+            continue
+        print(f"downloading {name}", flush=True)
+        urllib.request.urlretrieve(url, path)
+
+
 def main() -> None:
     models_dir = Path(os.environ.get("MODELS_DIR", "/models"))
     models_dir.mkdir(parents=True, exist_ok=True)
+    ensure_upscale_models(models_dir)
     ensure_models(models_dir, os.environ.get("HF_TOKEN") or None)
 
 

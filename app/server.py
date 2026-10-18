@@ -45,7 +45,12 @@ def _job(job_id: str) -> dict | None:
 
 
 def _job_id(path: str) -> str | None:
-    for prefix in ("/v1/images/", "/api/v1/images/"):
+    for prefix in (
+        "/v1/images/",
+        "/api/v1/images/",
+        "/v1/upscale/",
+        "/api/v1/upscale/",
+    ):
         if not path.startswith(prefix):
             continue
         job_id = path[len(prefix) :]
@@ -106,6 +111,72 @@ def _start_job(body: dict) -> str:
     return job_id
 
 
+def _start_upscale(body: dict) -> str:
+    if not isinstance(body, dict):
+        raise ValueError("Expected a JSON object.")
+    blob = _one_image(body.get("image"))
+    width = body.get("width")
+    height = body.get("height")
+    if not isinstance(width, int) or not isinstance(height, int):
+        raise ValueError("width and height must be integers")
+    job_id = uuid.uuid4().hex
+    _remember(job_id, {"id": job_id, "status": "running"})
+
+    def run() -> None:
+        try:
+            from upscale import restore
+
+            image = restore(blob, width, height)
+        except ValueError as exc:
+            _remember(
+                job_id,
+                {
+                    "id": job_id,
+                    "status": "failed",
+                    "error": str(exc),
+                    "http_status": 400,
+                },
+            )
+            return
+        except Exception as exc:
+            print(f"upscale {job_id} failed: {exc}", flush=True)
+            _remember(
+                job_id,
+                {
+                    "id": job_id,
+                    "status": "failed",
+                    "error": str(exc),
+                    "http_status": 502,
+                },
+            )
+            return
+        _remember(
+            job_id,
+            {
+                "id": job_id,
+                "status": "succeeded",
+                "created": int(time.time()),
+                "data": [
+                    {
+                        "b64_json": base64.b64encode(image).decode(),
+                        "media_type": "image/png",
+                    }
+                ],
+            },
+        )
+
+    threading.Thread(target=run, name=f"upscale-{job_id[:8]}", daemon=True).start()
+    return job_id
+
+
+def _one_image(value) -> bytes:
+    if isinstance(value, str):
+        return _fetch_reference(value)
+    if isinstance(value, dict):
+        return _fetch_reference((value.get("image_url") or {}).get("url") or value.get("url") or "")
+    raise ValueError("image is required")
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -137,6 +208,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = self.path.split("?", 1)[0]
+        if path in ("/v1/upscale", "/api/v1/upscale"):
+            length = int(self.headers.get("Content-Length", "0"))
+            try:
+                body = json.loads(self.rfile.read(length) or b"{}")
+                job_id = _start_upscale(body)
+            except (ValueError, json.JSONDecodeError) as exc:
+                self._json(400, {"error": str(exc)})
+                return
+            self._json(202, {"id": job_id, "status": "running"})
+            return
         if path not in ("/v1/images", "/api/v1/images"):
             self._json(404, {"error": "not found"})
             return

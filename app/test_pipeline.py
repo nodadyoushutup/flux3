@@ -4,6 +4,7 @@ from pathlib import Path
 
 from download_models import ensure_models, missing
 from pipeline import build_prompt, build_upsampler, canvas_size, megapixels, normalize_resolution, output_size
+from upscale import target_size
 
 
 class CanvasTest(unittest.TestCase):
@@ -89,6 +90,15 @@ class DownloadTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             ensure_models(Path(directory), None)
             self.assertTrue(missing(Path(directory)))
+
+
+class TargetSizeTest(unittest.TestCase):
+    def test_source_stays_even(self):
+        self.assertEqual(target_size(1001, 501, "source"), (1000, 500))
+
+    def test_2k_sets_the_long_edge(self):
+        self.assertEqual(target_size(1000, 500, "2K"), (2048, 1024))
+        self.assertEqual(target_size(500, 1000, "2K"), (1024, 2048))
 
 
 if __name__ == "__main__":
